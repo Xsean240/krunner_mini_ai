@@ -1,0 +1,24 @@
+[Desktop Entry]
+Type=Service
+Name=AI Chat (krunner-ai)
+Name[zh_CN]=AI 对话
+Comment=Free AI chat with context and web search (DeepSeek via SiliconFlow)
+Comment[zh_CN]=带上下文与联网搜索的免费 AI 对话（SiliconFlow/DeepSeek）
+Icon=dev.local.krunnerai
+
+X-KDE-ServiceTypes=Plasma/Runner
+X-Plasma-API=DBus
+X-Plasma-DBusRunner-Service=dev.local.krunnerai
+X-Plasma-DBusRunner-Path=/ai
+X-Plasma-Request-Actions-Once=true
+X-Plasma-AdvertiseSingleRunnerQueryMode=true
+
+X-Plasma-Runner-Syntaxes=ai :q:,ai 搜 :q:,ai 图 :q:,ai 窗口,ai reset,ai ping
+X-Plasma-Runner-Syntax-Descriptions=Ask the AI with conversation context,Search the web first then answer,Ask about an image file path,Open the persistent chat window,Clear conversation context,Health check
+
+X-KDE-PluginInfo-Author=Xsean240
+X-KDE-PluginInfo-Email=xsean240@users.noreply.github.com
+X-KDE-PluginInfo-Name=dev.local.krunnerai
+X-KDE-PluginInfo-Version=0.1.0
+X-KDE-PluginInfo-License=MIT
+X-KDE-PluginInfo-EnabledByDefault=true

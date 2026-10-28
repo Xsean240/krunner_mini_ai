@@ -1,0 +1,25 @@
+[Unit]
+Description=KRunner AI runner service (dev.local.krunnerai)
+After=graphical-session.target
+PartOf=graphical-session.target
+
+[Service]
+Type=dbus
+BusName=dev.local.krunnerai
+ExecStart=%h/.local/bin/krunner-ai-daemon
+Restart=on-failure
+RestartSec=3
+TimeoutStopSec=5
+
+# 沙箱加固：只读系统与家目录，仅允许写 ~/.cache/krunner-ai；
+# 仅允许 UNIX/IPv4/IPv6 套接字（DBus + 出站 HTTPS）。
+NoNewPrivileges=true
+PrivateTmp=true
+ProtectSystem=strict
+ProtectHome=read-only
+ReadWritePaths=%h/.cache/krunner-ai
+RestrictAddressFamilies=AF_UNIX AF_INET AF_INET6
+RestrictSUIDSGID=true
+
+[Install]
+WantedBy=graphical-session.target
