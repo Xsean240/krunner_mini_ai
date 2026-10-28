@@ -2,17 +2,27 @@
 # 修改后执行: systemctl --user restart krunner-ai
 
 [llm]
-# 智谱 BigModel —— glm-4-flash 长期免费、容量稳定（默认）；
-# glm-4.7-flash 更强但热门时段常过载，配置为备用模型，主模型繁忙时自动切换
-# key: https://bigmodel.cn 右上角控制台 → 「API Keys」创建（无需信用卡）
+# 主渠道：智谱 BigModel —— glm-4-flash 长期免费、容量稳定（默认）；
+# glm-4.7-flash 更强但热门时段常过载(1305)，作为备用模型；
+# glm-4v-flash 为免费视觉模型。key: https://bigmodel.cn 控制台「API Keys」创建
+# timeout 语义为【流式读超时】：只约束首字到达与流中途停滞，
+# 正常生成可以超过它而不会被误判超时。
 base_url  = "https://open.bigmodel.cn/api/paas/v4"
 api_key   = ""
 model     = "glm-4-flash"
 fallback_model = "glm-4.7-flash"
-vision_model   = "glm-4v-flash"        # 图片理解（免费）
+vision_model   = "glm-4v-flash"
+timeout      = 12
 max_tokens   = 800
 temperature  = 0.7
-timeout      = 14                       # 单次 LLM 请求超时（秒），需小于 chat.match_deadline
+
+# 副渠道（可选）：主渠道整体失败/超时时的最后一级，自动纳入重试梯子
+# 魔搭 ModelScope：需先在 modelscope.cn 「账号设置」绑定阿里云账号，否则 key 返回 401
+[llm.backup]
+base_url  = "https://api-inference.modelscope.cn/v1"
+api_key   = ""
+model     = "deepseek-ai/DeepSeek-V4.1-Flash"
+# vision_model = ""   # 副渠道视觉模型（可选，不配则图片只在主渠道尝试）
 
 [search]
 provider    = "tavily"                  # tavily | none（none 时 ai 搜 退化为纯模型回答）

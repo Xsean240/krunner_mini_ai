@@ -69,8 +69,16 @@
 base_url  = "https://open.bigmodel.cn/api/paas/v4"
 api_key   = ""
 model     = "glm-4-flash"        # 长期免费
-fallback_model = "glm-4.7-flash" # 主模型繁忙时自动切换
+fallback_model = "glm-4.7-flash" # 同渠道备用（繁忙时自动切换）
 vision_model   = "glm-4v-flash"  # 免费视觉模型
+timeout   = 12   # 流式读超时(秒)：只约束首字与流停滞，正常生成超时不会误杀
+
+# 副渠道（可选）：主渠道整体失败/超时时的最后一级
+# 魔搭需先在 modelscope.cn 绑定阿里云账号，否则 key 返回 401
+[llm.backup]
+base_url = "https://api-inference.modelscope.cn/v1"
+api_key  = ""
+model    = "deepseek-ai/DeepSeek-V4.1-Flash"
 
 [search]
 provider = "tavily"   # 或 none
@@ -80,6 +88,9 @@ api_key  = ""
 max_turns   = 8       # 记住的对话轮数
 auto_search = false   # true 时自动判断是否联网
 ```
+
+请求采用**流式接收**（超时只约束首字与停滞，长回答不会被整体误杀），
+并按**重试梯子**降级：主模型 → 备用模型 → 副渠道，全程自动。
 
 任何 OpenAI 兼容渠道都可使用，改 `base_url`/`api_key`/`model` 三行即可。
 

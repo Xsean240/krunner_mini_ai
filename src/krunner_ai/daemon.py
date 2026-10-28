@@ -67,18 +67,28 @@ log = logging.getLogger("krunner-ai")
 
 DEFAULT_CONFIG = {
     "llm": {
-        # 智谱 BigModel：glm-4-flash 长期免费、容量稳定（默认）；
-        # glm-4.7-flash 更强但热门时段常过载(1305)，作为备用自动切换；
-        # glm-4v-flash 为免费视觉模型（图片理解）
+        # 主渠道：智谱 BigModel —— glm-4-flash 长期免费、容量稳定（默认）；
+        # glm-4.7-flash 更强但热门时段常过载(1305)，作为备用模型；
+        # glm-4v-flash 为免费视觉模型（图片理解）。
+        # timeout 语义为【流式读超时】：只约束首字到达与流中途停滞，
+        # 正常生成可以超过它而不会被误判超时。
         # key 在 https://bigmodel.cn 控制台「API Keys」创建
         "base_url": "https://open.bigmodel.cn/api/paas/v4",
         "api_key": "",
         "model": "glm-4-flash",
         "fallback_model": "glm-4.7-flash",
         "vision_model": "glm-4v-flash",
+        "timeout": 12.0,
+        # 副渠道：主渠道整体失败/超时时的最后一级（可选）。
+        # 魔搭 ModelScope 注意：需先在 modelscope.cn 绑定阿里云账号，否则 401。
+        "backup": {
+            "base_url": "https://api-inference.modelscope.cn/v1",
+            "api_key": "",
+            "model": "deepseek-ai/DeepSeek-V4.1-Flash",
+            "vision_model": "",
+        },
         "max_tokens": 800,
         "temperature": 0.7,
-        "timeout": 14.0,
     },
     "search": {
         "provider": "tavily",
@@ -91,7 +101,7 @@ DEFAULT_CONFIG = {
         "auto_search": False,
         "debounce_ms": 800,
         "match_deadline": 18.0,
-        "bg_timeout": 45.0,
+        "bg_timeout": 60.0,
         "system_prompt": (
             "你是运行在 KDE KRunner 中的桌面助手。默认用简体中文回答"
             "（除非用户使用其他语言提问）。回答要简洁、先给结论，一般不超过 300 字。"
@@ -224,17 +234,34 @@ def extract_error_hint(status: int, body: str) -> str:
     return hint
 
 
+STREAM_HARD_CAP = 180.0  # 单次流式请求的绝对上限（秒），防异常流挂死线程
+
+
+def parse_sse_delta(data_str: str) -> str:
+    """解析 SSE `data:` 行里的增量文本；非内容行（心跳/推理过程/坏行）返回空。"""
+    try:
+        obj = json.loads(data_str)
+        return (obj.get("choices") or [{}])[0].get("delta", {}).get("content") or ""
+    except Exception:
+        return ""
+
+
 def chat_completion(cfg: dict, messages: list[dict], timeout: float,
-                    model: str | None = None) -> str:
-    """调用 OpenAI 兼容 /chat/completions，返回回答文本。model 可覆盖 cfg 中的默认。"""
-    use_model = model or cfg["model"]
+                    model: str | None = None, on_chunk=None) -> str:
+    """流式调用 OpenAI 兼容 /chat/completions，返回完整回答文本。
+
+    timeout 是【流读取超时】(秒)：约束首字到达时间与流中途的最大停滞；
+    只要 token 持续到达，总生成时间可以远超 timeout 而不判超时——
+    这是修复"长回答被整体误杀"的关键。on_chunk(delta) 供实时回调。
+    """
+    use_model = model or cfg.get("attempt_model") or cfg["model"]
     url = cfg["base_url"].rstrip("/") + "/chat/completions"
     payload = {
         "model": use_model,
         "messages": messages,
         "max_tokens": int(cfg.get("max_tokens", 800)),
         "temperature": float(cfg.get("temperature", 0.7)),
-        "stream": False,
+        "stream": True,
     }
     # GLM-4.5+（非视觉）是混合思考模型，默认深度思考会让回答慢到 20s 以上，
     # 对快问快答场景显式关闭（仅智谱端点生效，避免影响其他渠道）
@@ -245,20 +272,161 @@ def chat_completion(cfg: dict, messages: list[dict], timeout: float,
         "Content-Type": "application/json",
     }
     try:
-        resp = requests.post(url, json=payload, headers=headers, timeout=timeout)
+        resp = requests.post(url, json=payload, headers=headers,
+                             timeout=(5.0, float(timeout)), stream=True)
     except requests.Timeout:
-        raise LLMError("模型响应超时")
+        raise LLMError("模型响应超时（连接/等待首字）", retryable=True)
     except requests.RequestException as exc:
         raise LLMError(f"网络错误：{type(exc).__name__}", retryable=True)
     if resp.status_code != 200:
         hint = extract_error_hint(resp.status_code, resp.text)
-        # 429/5xx 多为容量或瞬态问题，值得换备用模型再试一次
         raise LLMError(hint, retryable=resp.status_code in (429, 500, 502, 503, 504))
+
+    parts: list[str] = []
     try:
-        data = resp.json()
-        return data["choices"][0]["message"]["content"].strip()
-    except Exception:
-        raise LLMError("返回内容解析失败")
+        started = time.monotonic()
+        for raw in resp.iter_lines():
+            if raw is None:
+                continue
+            line = raw.decode("utf-8", "ignore").strip() if isinstance(raw, bytes) else str(raw).strip()
+            if not line.startswith("data:"):
+                continue
+            data = line[5:].strip()
+            if data == "[DONE]":
+                break
+            delta = parse_sse_delta(data)
+            if delta:
+                parts.append(delta)
+                if on_chunk:
+                    try:
+                        on_chunk(delta)
+                    except Exception:
+                        pass
+            if time.monotonic() - started > STREAM_HARD_CAP:
+                raise LLMError("流式响应超过硬上限", retryable=False)
+    except requests.Timeout:
+        # 连接已建立：要么首字没来，要么生成中途停滞
+        raise LLMError("模型响应超时（流停滞）" if parts else "模型响应超时（无输出）",
+                       retryable=True)
+    except requests.RequestException as exc:
+        raise LLMError(f"流中断：{type(exc).__name__}", retryable=True)
+    answer = "".join(parts).strip()
+    if not answer:
+        raise LLMError("模型返回了空回答", retryable=True)
+    return answer
+
+
+class AskTimeout(LLMError):
+    """整体等待超时（底层任务仍在流式进行），持有 job 供后台继续等待同一请求。"""
+
+    def __init__(self, job: "AskJob"):
+        super().__init__("模型响应超时")
+        self.job = job
+
+
+def build_attempt_ladder(llm_cfg: dict, model_key: str = "model") -> list[dict]:
+    """按优先级生成尝试梯子（纯函数，便于测试）：
+    主渠道主模型 → 主渠道备用模型 → 副渠道。
+    每项是一次完整的请求配置（含 attempt_model 具体模型名）。"""
+    steps = []
+
+    def add(provider: dict, model: str):
+        if model:
+            step = dict(provider)
+            step["attempt_model"] = model
+            steps.append(step)
+
+    add(llm_cfg, llm_cfg.get(model_key))
+    backup = llm_cfg.get("backup") or {}
+    backup_ready = bool(backup.get("base_url") and backup.get("api_key"))
+    if model_key == "model":
+        fb = llm_cfg.get("fallback_model", "")
+        if fb and fb != llm_cfg.get("model"):
+            add(llm_cfg, fb)
+        if backup_ready and backup.get("model"):
+            merged = dict(llm_cfg)
+            merged.update(backup)
+            add(merged, backup["model"])
+    elif backup_ready and backup.get("vision_model"):
+        merged = dict(llm_cfg)
+        merged.update(backup)
+        add(merged, backup["vision_model"])
+    return steps
+
+
+class AskJob:
+    """一次问答任务：搜索(可选) + 按梯子逐个流式尝试。
+    成功后自行写入会话历史；外部 wait(超时) 限时等待，
+    超时抛 AskTimeout 且底层请求继续跑（可转后台接着等，不重复请求）。"""
+
+    def __init__(self, cfg: Config, session: Session, question: str, want_search: bool,
+                 image_b64: str = "", image_mime: str = "", on_chunk=None):
+        self.cfg = cfg
+        self.session = session
+        self.question = question
+        self.want_search = want_search
+        self.image_b64 = image_b64
+        self.image_mime = image_mime
+        self.on_chunk = on_chunk
+        self.done = threading.Event()
+        self.outcome = None            # (answer, model, searched) 或 LLMError
+        self.search_results = None
+        self.steps_taken: list[str] = []
+        threading.Thread(target=self._run, daemon=True).start()
+
+    def _run(self):
+        cfg = self.cfg
+        try:
+            searched = False
+            if self.want_search and cfg.search_ready():
+                try:
+                    self.search_results = tavily_search(
+                        cfg.search, self.question,
+                        min(float(cfg.search.get("timeout", 5.0)), 6.0))
+                    searched = True
+                except Exception as exc:
+                    log.info("搜索失败(fail-open): %s", type(exc).__name__)
+            elif self.want_search:
+                log.info("要求联网但 search 未配置，退化为纯模型回答")
+
+            messages = build_messages(cfg.chat.get("system_prompt", ""),
+                                      self.session.history(), self.search_results,
+                                      self.question, self.image_b64, self.image_mime)
+            model_key = "vision_model" if self.image_b64 else "model"
+            stream_to = float(cfg.llm.get("timeout", 12.0))
+
+            answer = None
+            model_used = ""
+            last_err: LLMError | None = None
+            for step in build_attempt_ladder(cfg.llm, model_key):
+                model_used = step["attempt_model"]
+                try:
+                    answer = chat_completion(step, messages, stream_to,
+                                             on_chunk=self.on_chunk)
+                    break
+                except LLMError as exc:
+                    last_err = exc
+                    self.steps_taken.append(f"{model_used}: {exc}")
+                    log.info("尝试 %s 失败: %s", model_used, exc)
+                    answer = None
+            if answer is None:
+                self.outcome = last_err or LLMError("没有可用的模型配置")
+            else:
+                user_text = ("[图片] " + self.question) if self.image_b64 else self.question
+                self.session.add_turn(user_text, answer)
+                self.outcome = (answer, model_used, searched)
+        except Exception:
+            log.exception("AskJob 内部异常")
+            self.outcome = LLMError("内部错误")
+        finally:
+            self.done.set()
+
+    def wait(self, timeout: float):
+        if not self.done.wait(timeout):
+            raise AskTimeout(self)
+        if isinstance(self.outcome, LLMError):
+            raise self.outcome
+        return self.outcome
 
 
 def tavily_search(cfg: dict, query: str, timeout: float) -> list[dict]:
@@ -494,50 +662,6 @@ class RunnerService(dbus.service.Object):
 
     # ------------------------------------------------------------------ 内部
 
-    def _llm_ask(self, messages: list[dict], timeout: float,
-                 model_key: str = "model") -> tuple[str, str]:
-        """调用主模型；若遇限速/服务端繁忙且配置了备用模型，自动换备用重试一次。
-        返回 (回答文本, 实际使用的模型名)。model_key 指定用 text 还是 vision 模型。"""
-        cfg = self.cfg
-        primary = cfg.llm.get(model_key, "")
-        try:
-            return chat_completion(cfg.llm, messages, timeout, model=primary), primary
-        except LLMError as exc:
-            fallback = cfg.llm.get("fallback_model", "")
-            if not (exc.retryable and fallback and fallback != primary and model_key == "model"):
-                raise
-            log.info("主模型 %s 失败(%s)，改用备用 %s", primary, exc, fallback)
-            try:
-                return chat_completion(cfg.llm, messages, timeout, model=fallback), fallback
-            except LLMError:
-                raise exc  # 备用也失败时上报原始错误，避免误导
-
-    def _search_and_ask(self, question: str, want_search: bool,
-                        image_b64: str = "", image_mime: str = ""
-                        ) -> tuple[str, str, bool]:
-        """搜索(可选)+LLM 完整问答。返回 (回答, 实际模型, 是否联网)。失败抛 LLMError。"""
-        cfg = self.cfg
-        search_results = None
-        searched = False
-        if want_search:
-            if cfg.search_ready():
-                try:
-                    t_out = min(float(cfg.search.get("timeout", 5.0)), 5.0)
-                    search_results = tavily_search(cfg.search, question, t_out)
-                    searched = True
-                except Exception as exc:
-                    log.info("搜索失败(fail-open): %s", type(exc).__name__)
-            else:
-                log.info("要求联网但 search 未配置，退化为纯模型回答")
-        messages = build_messages(cfg.chat.get("system_prompt", ""),
-                                  self.session.history(), search_results,
-                                  question, image_b64, image_mime)
-        model_key = "vision_model" if image_b64 else "model"
-        answer, model_used = self._llm_ask(messages, float(cfg.llm.get("timeout", 14.0)),
-                                           model_key=model_key)
-        self._last_search_results = search_results
-        return answer, model_used, searched
-
     def _register_query(self, body: str) -> None:
         with self._state_lock:
             self._current_query = body
@@ -670,69 +794,48 @@ class RunnerService(dbus.service.Object):
                                          "格式：ai 图 /路径/图片.png 问题（支持 png/jpg/webp/bmp/gif）")]
             display_q = parsed.body or "（描述这张图片）"
 
-        # 2) LLM（若赶不上 Match 预算则转后台；图片也受预算约束，超时自动转后台）
+        # 2) LLM：AskJob 内部按梯子流式尝试；赶不上 Match 预算则同一请求转后台
         remaining = deadline - time.monotonic()
-        if remaining <= 2.0:
+        if remaining <= 1.5:
             return self._spawn_background(display_q, want_search, image_b64, image_mime)
+
+        job = AskJob(cfg, self.session, display_q, want_search, image_b64, image_mime)
         try:
-            if image_b64:
-                # 视觉请求慢，但 KRunner 等不了 25s 以上：给足预算内的时间，超时转后台
-                timeout = min(float(cfg.chat.get("bg_timeout", 45.0)),
-                              max(deadline - time.monotonic() - 1.0, 3.0))
-            else:
-                timeout = float(cfg.llm.get("timeout", 14.0))
-            answer, model_used, searched = self._ask_with_timeout(display_q, want_search,
-                                                                  image_b64, image_mime, timeout)
+            answer, model_used, searched = job.wait(remaining)
+        except AskTimeout as timeout_exc:
+            # KRunner 等不及了：同一请求转后台继续，不重复发起
+            return self._spawn_background_job(timeout_exc.job)
         except LLMError as exc:
-            if "超时" in str(exc):
-                return self._spawn_background(display_q, want_search, image_b64, image_mime)
-            return [self._info_match("error", f"✗ {exc}", "dialog-error",
-                                     f"模型 {cfg.llm.get('model')}")]
-        self.session.add_turn(("[图片] " + display_q) if image_b64 else parsed.body, answer)
+            hint = str(exc)
+            if job.steps_taken:
+                tried = " → ".join(s.split(":")[0] for s in job.steps_taken)
+                hint += f"（已尝试: {tried}）"
+            return [self._info_match("error", f"✗ {hint}", "dialog-error",
+                                     f"主模型 {cfg.llm.get('model')}")]
+
         mid = self._store_answer(answer)
         meta = (f"{model_used} · 上下文 {self.session.turns()} 轮 · 回车复制全文"
                 + (" · 已联网" if searched else ""))
         matches = [self._answer_match(mid, answer, meta)]
-        matches.extend(self._source_matches(self._last_search_results))
-        log.info("问答完成 耗时%.1fs 联网=%s 图片=%s 字数=%d",
-                 time.monotonic() - started, searched, bool(image_b64), len(answer))
+        matches.extend(self._source_matches(job.search_results))
+        log.info("问答完成 耗时%.1fs 联网=%s 图片=%s 字数=%d 尝试级数=%d",
+                 time.monotonic() - started, searched, bool(image_b64), len(answer),
+                 len(job.steps_taken) + 1)
         return matches
 
-    # 简单缓存最近一次搜索结果供来源条目展示
-    _last_search_results = None
-
-    def _ask_with_timeout(self, question, want_search, image_b64, image_mime, timeout):
-        result = {}
-
-        def run():
-            try:
-                result["value"] = self._search_and_ask(question, want_search, image_b64, image_mime)
-            except LLMError as exc:
-                result["error"] = exc
-
-        t = threading.Thread(target=run, daemon=True)
-        t.start()
-        t.join(timeout)
-        if "value" in result:
-            return result["value"]
-        if "error" in result:
-            raise result["error"]
-        raise LLMError("模型响应超时")
-
     def _spawn_background(self, question, want_search, image_b64="", image_mime=""):
-        threading.Thread(target=self._background_generate,
-                         args=(question, want_search, image_b64, image_mime),
-                         daemon=True).start()
-        return [self._info_match("bg", "⏳ 响应较慢，已转后台…", "view-refresh",
-                                 "生成完成后将弹系统通知并自动复制全文")]
+        return self._spawn_background_job(
+            AskJob(self.cfg, self.session, question, want_search, image_b64, image_mime))
 
-    def _background_generate(self, question, want_search, image_b64, image_mime):
+    def _spawn_background_job(self, job: AskJob):
+        threading.Thread(target=self._watch_job, args=(job,), daemon=True).start()
+        return [self._info_match("bg", "⏳ 响应较慢，已转后台…", "view-refresh",
+                                 "同一请求继续生成，完成后弹通知并自动复制全文")]
+
+    def _watch_job(self, job: AskJob):
         cfg = self.cfg
         try:
-            timeout = float(cfg.chat.get("bg_timeout", 45.0))
-            answer, model_used, _ = self._ask_with_timeout(
-                question, want_search, image_b64, image_mime, timeout)
-            self.session.add_turn(("[图片] " + question) if image_b64 else question, answer)
+            answer, model_used, _searched = job.wait(float(cfg.chat.get("bg_timeout", 60.0)))
             self._store_answer(answer)
             copied = klipper_set_clipboard(self.bus, answer)
             body = answer[:280] + ("…" if len(answer) > 280 else "")
@@ -741,6 +844,9 @@ class RunnerService(dbus.service.Object):
             if model_used != cfg.llm.get("model"):
                 body = f"[{model_used}] " + body
             notify(self.bus, "KRunner AI 回答（已生成）", body)
+        except AskTimeout:
+            notify(self.bus, "KRunner AI 回答超时",
+                   "后台等待超时，请稍后重试（详见 journalctl --user -u krunner-ai）")
         except LLMError as exc:
             notify(self.bus, "KRunner AI 回答失败", str(exc))
 
@@ -882,10 +988,8 @@ class ChatInterface(dbus.service.Object):
             if not cfg.llm_ready():
                 return_cb(_reply_json(False, error="未配置 API key"))
                 return
-            timeout = float(cfg.chat.get("bg_timeout", 45.0))
-            answer, model_used, searched = self.engine._ask_with_timeout(
-                question, search, image_b64, mime, timeout)
-            self.session.add_turn(("[图片] " + question) if image_b64 else question, answer)
+            job = AskJob(cfg, self.session, question, bool(search), image_b64, mime)
+            answer, model_used, searched = job.wait(float(cfg.chat.get("bg_timeout", 60.0)))
             return_cb(_reply_json(True, answer, model_used, searched))
         except LLMError as exc:
             return_cb(_reply_json(False, error=str(exc)))
@@ -936,6 +1040,11 @@ def selftest(net: bool = False) -> int:
     print(f"模型: {cfg.llm.get('model')} @ {cfg.llm.get('base_url')}  key: {masked(cfg.llm.get('api_key',''))}")
     print(f"视觉: {cfg.llm.get('vision_model')}  搜索: {cfg.search.get('provider')}  "
           f"key: {masked(cfg.search.get('api_key',''))}")
+    backup = cfg.llm.get("backup") or {}
+    if backup.get("api_key") and backup.get("base_url"):
+        print(f"副渠道: {backup.get('model')} @ {backup.get('base_url')}  key: {masked(backup.get('api_key',''))}")
+    else:
+        print("副渠道: 未启用（[llm.backup] 未配置 key）")
     print(f"窗口程序: {CHAT_BIN} ({'已安装' if os.path.isfile(CHAT_BIN) else '未安装（ai 窗口 不可用）'})")
     ok = True
     if not cfg.llm_ready():

@@ -149,6 +149,61 @@ class TestExtractErrorHint(unittest.TestCase):
         self.assertGreaterEqual(len(hint), 80)
 
 
+class TestSSEParse(unittest.TestCase):
+    def test_delta_content(self):
+        self.assertEqual(
+            daemon.parse_sse_delta('{"choices":[{"delta":{"content":"你好"}}]}'), "你好")
+
+    def test_reasoning_only_ignored(self):
+        self.assertEqual(
+            daemon.parse_sse_delta('{"choices":[{"delta":{"reasoning_content":"思考中"}}]}'), "")
+
+    def test_garbage_and_empty(self):
+        self.assertEqual(daemon.parse_sse_delta("not json"), "")
+        self.assertEqual(daemon.parse_sse_delta("{}"), "")
+
+
+class TestAttemptLadder(unittest.TestCase):
+    BASE = {
+        "base_url": "https://bigmodel.cn/v1", "api_key": "zhihu-key",
+        "model": "glm-4-flash", "fallback_model": "glm-4.7-flash",
+        "vision_model": "glm-4v-flash", "max_tokens": 800, "temperature": 0.7,
+    }
+
+    def test_two_steps_without_backup(self):
+        steps = daemon.build_attempt_ladder(self.BASE)
+        self.assertEqual([s["attempt_model"] for s in steps],
+                         ["glm-4-flash", "glm-4.7-flash"])
+
+    def test_three_steps_with_backup(self):
+        cfg = dict(self.BASE, backup={
+            "base_url": "https://modelscope/v1", "api_key": "ms-key",
+            "model": "deepseek-ai/DeepSeek-V4.1-Flash"})
+        steps = daemon.build_attempt_ladder(cfg)
+        self.assertEqual([s["attempt_model"] for s in steps],
+                         ["glm-4-flash", "glm-4.7-flash", "deepseek-ai/DeepSeek-V4.1-Flash"])
+        self.assertEqual(steps[2]["base_url"], "https://modelscope/v1")
+        self.assertEqual(steps[2]["api_key"], "ms-key")
+        self.assertEqual(steps[0]["api_key"], "zhihu-key")  # 前两级不受副渠道影响
+
+    def test_backup_without_key_disabled(self):
+        cfg = dict(self.BASE, backup={"base_url": "https://modelscope/v1",
+                                      "api_key": "", "model": "x"})
+        self.assertEqual(len(daemon.build_attempt_ladder(cfg)), 2)
+
+    def test_vision_ladder(self):
+        cfg = dict(self.BASE, backup={
+            "base_url": "https://modelscope/v1", "api_key": "ms-key",
+            "model": "ds-text", "vision_model": "ds-vision"})
+        steps = daemon.build_attempt_ladder(cfg, "vision_model")
+        self.assertEqual([s["attempt_model"] for s in steps],
+                         ["glm-4v-flash", "ds-vision"])
+        no_vs = dict(self.BASE, backup={
+            "base_url": "https://modelscope/v1", "api_key": "ms-key", "model": "ds"})
+        self.assertEqual([s["attempt_model"] for s in
+                          daemon.build_attempt_ladder(no_vs, "vision_model")], ["glm-4v-flash"])
+
+
 class TestAutoSearchHeuristic(unittest.TestCase):
     def test_time_words(self):
         self.assertTrue(daemon.looks_like_search_needed("DeepSeek 最新版本"))
