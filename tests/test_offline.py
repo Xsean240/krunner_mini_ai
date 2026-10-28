@@ -204,6 +204,98 @@ class TestAttemptLadder(unittest.TestCase):
                           daemon.build_attempt_ladder(no_vs, "vision_model")], ["glm-4v-flash"])
 
 
+class TestSearchModeParse(unittest.TestCase):
+    def test_plain(self):
+        p = daemon.parse_query("ai 搜 量子计算", "ai", "搜")
+        self.assertEqual((p.kind, p.search_depth, p.search_news), ("ask_search", "basic", False))
+
+    def test_news(self):
+        p = daemon.parse_query("ai 搜 新闻 量子计算", "ai", "搜")
+        self.assertEqual((p.search_depth, p.search_news, p.body), ("basic", True, "量子计算"))
+
+    def test_advanced(self):
+        p = daemon.parse_query("ai 搜 深度 对比RFC", "ai", "搜")
+        self.assertEqual((p.search_depth, p.search_news, p.body), ("advanced", False, "对比RFC"))
+
+    def test_news_and_advanced_combined(self):
+        p = daemon.parse_query("ai 搜 新闻 深 芯片出口", "ai", "搜")
+        self.assertEqual((p.search_depth, p.search_news, p.body), ("advanced", True, "芯片出口"))
+
+    def test_model_panel_parse(self):
+        self.assertEqual(daemon.parse_query("ai 模型", "ai", "搜").kind, "model_panel")
+        p = daemon.parse_query("ai 模型 glm", "ai", "搜")
+        self.assertEqual((p.kind, p.body), ("model_panel", "glm"))
+
+
+class TestTavilyBody(unittest.TestCase):
+    CFG = {"api_key": "tvly-x", "max_results": 3}
+
+    def test_basic(self):
+        b = daemon.tavily_request_body(self.CFG, "q")
+        self.assertEqual(b["search_depth"], "basic")
+        self.assertNotIn("topic", b)
+
+    def test_news(self):
+        b = daemon.tavily_request_body(self.CFG, "q", news=True)
+        self.assertEqual(b["topic"], "news")
+        self.assertEqual(b["time_range"], "week")
+
+    def test_advanced(self):
+        b = daemon.tavily_request_body(self.CFG, "q", depth="advanced")
+        self.assertEqual(b["search_depth"], "advanced")
+
+
+class TestActiveModelLadder(unittest.TestCase):
+    BASE = {
+        "base_url": "https://bigmodel.cn/v1", "api_key": "z",
+        "model": "glm-4-flash", "fallback_model": "glm-4.7-flash",
+        "vision_model": "glm-4v-flash",
+        "backup": {"base_url": "https://modelscope/v1", "api_key": "m",
+                   "model": "ds-flash"},
+    }
+
+    def test_active_reorder_to_front(self):
+        steps = daemon.build_attempt_ladder(self.BASE, "model", active="ds-flash")
+        self.assertEqual(steps[0]["attempt_model"], "ds-flash")
+        self.assertEqual(steps[0]["api_key"], "m")          # 连同副渠道配置一起提前
+        self.assertEqual(len(steps), 3)
+
+    def test_active_custom_model_on_primary(self):
+        steps = daemon.build_attempt_ladder(self.BASE, "model", active="glm-4-plus")
+        self.assertEqual(steps[0]["attempt_model"], "glm-4-plus")
+        self.assertEqual(steps[0]["api_key"], "z")
+        self.assertEqual(steps[1]["attempt_model"], "glm-4-flash")
+
+    def test_vision_ignores_active(self):
+        steps = daemon.build_attempt_ladder(self.BASE, "vision_model", active="glm-4-flash")
+        self.assertEqual(steps[0]["attempt_model"], "glm-4v-flash")
+
+
+class TestModelPanel(unittest.TestCase):
+    BASE = {
+        "base_url": "https://bigmodel.cn/v1", "api_key": "z",
+        "model": "glm-4-flash", "fallback_model": "glm-4.7-flash",
+        "vision_model": "glm-4v-flash",
+        "backup": {"base_url": "https://modelscope/v1", "api_key": "m",
+                   "model": "ds-flash"},
+    }
+
+    def test_entries_and_current_marker(self):
+        entries = daemon.model_panel_entries(self.BASE, active="")
+        self.assertTrue(entries[0]["current"])               # 自动 为当前
+        self.assertEqual(len(entries), 4)
+        entries2 = daemon.model_panel_entries(self.BASE, active="glm-4.7-flash")
+        self.assertTrue([e for e in entries2 if e["model"] == "glm-4.7-flash"][0]["current"])
+
+    def test_filter(self):
+        entries = daemon.model_panel_entries(self.BASE, active="")
+        hits = daemon.match_model_entries(entries, "魔搭")
+        # "魔搭" 同时命中自动条目（标签里含"魔搭"）和魔搭模型本身
+        self.assertEqual([h["model"] for h in hits], ["", "ds-flash"])
+        self.assertIsNone(daemon.match_model_entries(entries, "不存在的词"))
+        self.assertEqual(daemon.match_model_entries(entries, ""), entries)
+
+
 class TestAutoSearchHeuristic(unittest.TestCase):
     def test_time_words(self):
         self.assertTrue(daemon.looks_like_search_needed("DeepSeek 最新版本"))

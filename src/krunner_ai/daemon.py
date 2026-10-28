@@ -52,6 +52,7 @@ WINDOW_NAME = "dev.local.krunnerai.window"
 HOME = os.path.expanduser("~")
 CONFIG_PATH = os.path.join(HOME, ".config", "krunner-ai", "config.toml")
 CACHE_DIR = os.path.join(HOME, ".cache", "krunner-ai")
+STATE_PATH = os.path.join(CACHE_DIR, "state.json")   # 主动模型切换等运行时状态（守护沙箱内可写）
 CHAT_BIN = os.path.join(HOME, ".local", "bin", "krunner-ai-chat")
 
 IMAGE_EXTS = {".png", ".jpg", ".jpeg", ".webp", ".bmp", ".gif"}
@@ -113,8 +114,27 @@ DEFAULT_CONFIG = {
         "search_keyword": "搜",
         "window_keywords": "窗口,chat",
         "image_keyword": "图",
+        "model_keyword": "模型",
     },
 }
+
+
+def read_active_model() -> str:
+    """读取用户主动指定的当前模型（空串=自动/完整梯子）。文件异常时按自动处理。"""
+    try:
+        with open(STATE_PATH, encoding="utf-8") as f:
+            return str(json.load(f).get("active_model", "") or "")
+    except Exception:
+        return ""
+
+
+def write_active_model(name: str) -> None:
+    os.makedirs(CACHE_DIR, mode=0o700, exist_ok=True)
+    tmp = STATE_PATH + ".tmp"
+    with open(tmp, "w", encoding="utf-8") as f:
+        json.dump({"active_model": name}, f, ensure_ascii=False)
+    os.replace(tmp, STATE_PATH)
+    os.chmod(STATE_PATH, 0o600)
 
 
 def deep_merge(base: dict, override: dict) -> dict:
@@ -324,10 +344,12 @@ class AskTimeout(LLMError):
         self.job = job
 
 
-def build_attempt_ladder(llm_cfg: dict, model_key: str = "model") -> list[dict]:
+def build_attempt_ladder(llm_cfg: dict, model_key: str = "model",
+                         active: str = "") -> list[dict]:
     """按优先级生成尝试梯子（纯函数，便于测试）：
-    主渠道主模型 → 主渠道备用模型 → 副渠道。
-    每项是一次完整的请求配置（含 attempt_model 具体模型名）。"""
+    [active 指定模型] → 主渠道主模型 → 主渠道备用模型 → 副渠道。
+    每项是一次完整的请求配置（含 attempt_model 具体模型名）。
+    active 为空时即普通梯子；指定已存在的模型会被提到首位，未知的按主渠道自定义模型处理。"""
     steps = []
 
     def add(provider: dict, model: str):
@@ -351,7 +373,44 @@ def build_attempt_ladder(llm_cfg: dict, model_key: str = "model") -> list[dict]:
         merged = dict(llm_cfg)
         merged.update(backup)
         add(merged, backup["vision_model"])
+
+    if active and model_key == "model":
+        idx = next((i for i, s in enumerate(steps) if s["attempt_model"] == active), None)
+        if idx is not None:
+            steps.insert(0, steps.pop(idx))
+        else:
+            steps.insert(0, {**llm_cfg, "attempt_model": active})
     return steps
+
+
+def provider_label(base_url: str) -> str:
+    if "bigmodel.cn" in base_url:
+        return "智谱"
+    if "modelscope" in base_url:
+        return "魔搭"
+    return base_url.split("//")[-1].split("/")[0]
+
+
+def model_panel_entries(llm_cfg: dict, active: str) -> list[dict]:
+    """模型面板条目（纯函数）：自动(梯子) + 各可用模型，标注渠道与当前选择。"""
+    entries = [{"model": "", "label": "自动 · 完整梯子（智谱→备用→魔搭）",
+                "provider": "", "current": not active}]
+    for step in build_attempt_ladder(llm_cfg, "model"):
+        m = step["attempt_model"]
+        entries.append({"model": m,
+                        "label": f"{m} · {provider_label(step['base_url'])}",
+                        "provider": provider_label(step["base_url"]),
+                        "current": m == active})
+    return entries
+
+
+def match_model_entries(entries: list[dict], text: str):
+    """按子串过滤面板条目；text 非空且无命中时返回 None（调用方回退为普通提问）。"""
+    if not text:
+        return entries
+    t = text.lower()
+    hits = [e for e in entries if t in e["model"].lower() or t in e["label"].lower()]
+    return hits or None
 
 
 class AskJob:
@@ -360,7 +419,8 @@ class AskJob:
     超时抛 AskTimeout 且底层请求继续跑（可转后台接着等，不重复请求）。"""
 
     def __init__(self, cfg: Config, session: Session, question: str, want_search: bool,
-                 image_b64: str = "", image_mime: str = "", on_chunk=None):
+                 image_b64: str = "", image_mime: str = "", on_chunk=None,
+                 search_depth: str = "basic", search_news: bool = False, active: str | None = None):
         self.cfg = cfg
         self.session = session
         self.question = question
@@ -368,6 +428,9 @@ class AskJob:
         self.image_b64 = image_b64
         self.image_mime = image_mime
         self.on_chunk = on_chunk
+        self.search_depth = search_depth
+        self.search_news = search_news
+        self.active = read_active_model() if active is None else active
         self.done = threading.Event()
         self.outcome = None            # (answer, model, searched) 或 LLMError
         self.search_results = None
@@ -382,7 +445,8 @@ class AskJob:
                 try:
                     self.search_results = tavily_search(
                         cfg.search, self.question,
-                        min(float(cfg.search.get("timeout", 5.0)), 6.0))
+                        min(float(cfg.search.get("timeout", 5.0)), 6.0),
+                        depth=self.search_depth, news=self.search_news)
                     searched = True
                 except Exception as exc:
                     log.info("搜索失败(fail-open): %s", type(exc).__name__)
@@ -398,7 +462,7 @@ class AskJob:
             answer = None
             model_used = ""
             last_err: LLMError | None = None
-            for step in build_attempt_ladder(cfg.llm, model_key):
+            for step in build_attempt_ladder(cfg.llm, model_key, self.active):
                 model_used = step["attempt_model"]
                 try:
                     answer = chat_completion(step, messages, stream_to,
@@ -429,15 +493,25 @@ class AskJob:
         return self.outcome
 
 
-def tavily_search(cfg: dict, query: str, timeout: float) -> list[dict]:
-    """Tavily 搜索，返回 [{title,url,content}]。失败时抛异常，由调用方 fail-open。"""
+def tavily_request_body(cfg: dict, query: str, depth: str = "basic", news: bool = False) -> dict:
+    """构造 Tavily 请求体（纯函数，便于测试）。"""
     body = {
         "api_key": cfg["api_key"],
         "query": query,
         "max_results": int(cfg.get("max_results", 3)),
-        "search_depth": "basic",
+        "search_depth": depth,
     }
-    resp = requests.post("https://api.tavily.com/search", json=body, timeout=timeout)
+    if news:
+        body["topic"] = "news"
+        body["time_range"] = cfg.get("news_time_range", "week")
+    return body
+
+
+def tavily_search(cfg: dict, query: str, timeout: float, depth: str = "basic",
+                  news: bool = False) -> list[dict]:
+    """Tavily 搜索，返回 [{title,url,content}]。失败时抛异常，由调用方 fail-open。"""
+    resp = requests.post("https://api.tavily.com/search",
+                         json=tavily_request_body(cfg, query, depth, news), timeout=timeout)
     resp.raise_for_status()
     return [
         {
@@ -504,13 +578,16 @@ def load_image_b64(path: str) -> tuple[str, str]:
 
 @dataclass
 class ParsedQuery:
-    kind: str  # help | window | reset | ping | ask | ask_search | ask_image
+    kind: str  # help | window | reset | ping | model_panel | ask | ask_search | ask_image
     body: str = ""
     image_path: str = ""
+    search_depth: str = "basic"   # basic | advanced（ai 搜 深）
+    search_news: bool = False     # True 表示新闻专题搜索（ai 搜 新闻）
 
 
 def parse_query(raw: str, trigger: str, search_keyword: str,
-                window_keywords: tuple = (), image_keyword: str = "图") -> ParsedQuery:
+                window_keywords: tuple = (), image_keyword: str = "图",
+                model_keyword: str = "模型") -> ParsedQuery:
     text = raw.strip()
     # KRunner 单 runner 模式可能传入已去掉触发词的剩余部分，两种都兼容
     if text.lower().startswith(trigger.lower() + " "):
@@ -525,10 +602,23 @@ def parse_query(raw: str, trigger: str, search_keyword: str,
         return ParsedQuery(kind="ping")
     if text.lower() in window_keywords:
         return ParsedQuery(kind="window")
+    if model_keyword and (text == model_keyword or text.startswith(model_keyword + " ")):
+        return ParsedQuery(kind="model_panel", body=text[len(model_keyword):].strip())
     if search_keyword and text.startswith(search_keyword + " "):
         rest = text[len(search_keyword) + 1:].strip()
+        depth, news = "basic", False
+        # 可选前置修饰词：新闻/news（新闻专题）、深/深度/advanced（深度检索，消耗 2 倍额度）
+        while rest:
+            tok, _, remain = rest.partition(" ")
+            if tok in ("新闻", "news"):
+                news, rest = True, remain.strip()
+                continue
+            if tok in ("深", "深度", "advanced"):
+                depth, rest = "advanced", remain.strip()
+                continue
+            break
         if rest:
-            return ParsedQuery(kind="ask_search", body=rest)
+            return ParsedQuery(kind="ask_search", body=rest, search_depth=depth, search_news=news)
     if image_keyword and text.startswith(image_keyword + " "):
         rest = text[len(image_keyword) + 1:].strip()
         # 格式：图 <路径> <问题>；路径中的空格用引号包裹即可
@@ -734,13 +824,21 @@ class RunnerService(dbus.service.Object):
                              ui.get("trigger", "ai"),
                              ui.get("search_keyword", "搜"),
                              tuple(k.strip() for k in ui.get("window_keywords", "窗口").split(",") if k.strip()),
-                             ui.get("image_keyword", "图"))
+                             ui.get("image_keyword", "图"),
+                             ui.get("model_keyword", "模型"))
 
         if parsed.kind == "help":
             return self._help_matches()
         if parsed.kind == "window":
             return [self._info_match("open-chat", "💬 打开 AI 对话窗口", "dev.local.krunnerai",
                                      "持续对话 · 支持图片 · 与 KRunner 共享上下文", mtype=0)]
+        if parsed.kind == "model_panel":
+            panel = self._model_panel(parsed.body)
+            if panel is not None:
+                return panel
+            # 筛选词没命中任何模型：当作普通提问（把"模型"还给问题原文）
+            parsed = ParsedQuery(kind="ask",
+                                 body=ui.get("model_keyword", "模型") + " " + parsed.body)
         if parsed.kind == "reset":
             self.session.clear()
             return [self._info_match("reset-done", "✓ 上下文已清空", "edit-clear",
@@ -799,7 +897,8 @@ class RunnerService(dbus.service.Object):
         if remaining <= 1.5:
             return self._spawn_background(display_q, want_search, image_b64, image_mime)
 
-        job = AskJob(cfg, self.session, display_q, want_search, image_b64, image_mime)
+        job = AskJob(cfg, self.session, display_q, want_search, image_b64, image_mime,
+                     search_depth=parsed.search_depth, search_news=parsed.search_news)
         try:
             answer, model_used, searched = job.wait(remaining)
         except AskTimeout as timeout_exc:
@@ -851,7 +950,28 @@ class RunnerService(dbus.service.Object):
             notify(self.bus, "KRunner AI 回答失败", str(exc))
 
     # -- Run 的本地固定动作（不解析、不执行模型输出中的任何"指令"） -----------
+    def _model_panel(self, filter_text: str):
+        """`ai 模型 [筛选]`：列出可切换模型。筛选无命中返回 None（回退为普通提问）。"""
+        entries = model_panel_entries(self.cfg.llm, read_active_model())
+        hits = match_model_entries(entries, filter_text)
+        if hits is None:
+            return None
+        matches = []
+        for e in hits:
+            mark = "✓ " if e["current"] else ""
+            title = f"{mark}{e['label']}"
+            sub = "当前使用中" if e["current"] else "回车切换为当前模型（梯子自动降级为兜底）"
+            icon = "starred" if e["current"] else "dev.local.krunnerai"
+            matches.append(self._info_match(f"setmodel|{e['model']}", title, icon, sub, mtype=0))
+        return matches
+
     def _run(self, match_id: str, action_id: str):
+        if match_id.startswith("setmodel|"):
+            name = match_id.split("|", 1)[1]
+            write_active_model(name)
+            label = name if name else "自动（完整梯子）"
+            notify(self.bus, "已切换模型", f"当前: {label}\n下次提问生效；失败时梯子自动兜底")
+            return
         if match_id == "open-chat":
             self._focus_or_spawn_window()
             return
@@ -915,11 +1035,12 @@ class RunnerService(dbus.service.Object):
         ik = cfg.ui.get("image_keyword", "图")
         lines = [
             (f"{t} <问题> — 提问（自动携带上下文）", "edit-copy", ""),
-            (f"{t} {sk} <问题> — 先联网搜索再回答", "internet-web-browser", ""),
+            (f"{t} {sk} <问题> — 联网搜索后回答（{sk} 新闻 …/ {sk} 深 …）", "internet-web-browser", ""),
+            (f"{t} 模型 — 查看/切换当前模型", "starred", ""),
             (f"{t} 窗口 — 打开持续对话小窗口（支持图片）", "dev.local.krunnerai", ""),
             (f"{t} {ik} /路径/图片.png <问题> — 图片理解", "emblem-photos", ""),
             (f"{t} reset — 清空上下文（当前 {self.session.turns()} 轮）", "edit-clear", ""),
-            (f"状态：模型 {cfg.llm.get('model')} "
+            (f"状态：模型 {read_active_model() or cfg.llm.get('model')} "
              f"({'key 已配置' if cfg.llm_ready() else '缺 key'}) · "
              f"联网 {'可用' if cfg.search_ready() else '缺 key'})", "dialog-information", ""),
         ]
@@ -935,9 +1056,20 @@ class RunnerService(dbus.service.Object):
 # ---------------------------------------------------------------------------
 
 def _reply_json(ok: bool, answer: str = "", model: str = "", searched: bool = False,
-                error: str = "") -> str:
+                error: str = "", sources: list | None = None) -> str:
     return json.dumps({"ok": ok, "answer": answer, "model": model,
-                       "searched": searched, "error": error}, ensure_ascii=False)
+                       "searched": searched, "error": error,
+                       "sources": sources or []}, ensure_ascii=False)
+
+
+def _decode_search_mode(mode) -> tuple[str, bool]:
+    """窗口传入的模式编号 → (search_depth, news)。0=不搜 1=基础 2=新闻 3=深度。"""
+    mode = int(mode)
+    if mode == 2:
+        return "basic", True
+    if mode == 3:
+        return "advanced", False
+    return "basic", False
 
 
 class ChatInterface(dbus.service.Object):
@@ -949,18 +1081,21 @@ class ChatInterface(dbus.service.Object):
         self.session = session
         self.engine = engine
 
-    @dbus.service.method(CHAT_IFACE, in_signature="sb", out_signature="s",
+    @dbus.service.method(CHAT_IFACE, in_signature="su", out_signature="s",
                          async_callbacks=("return_cb", "error_cb"))
-    def Ask(self, question, search, return_cb, error_cb):
+    def Ask(self, question, mode, return_cb, error_cb):
+        depth, news = _decode_search_mode(mode)
         threading.Thread(target=self._worker, daemon=True,
-                         args=(str(question), bool(search), "", "", return_cb, error_cb)).start()
-
-    @dbus.service.method(CHAT_IFACE, in_signature="sssb", out_signature="s",
-                         async_callbacks=("return_cb", "error_cb"))
-    def AskImage(self, question, image_b64, mime, search, return_cb, error_cb):
-        threading.Thread(target=self._worker, daemon=True,
-                         args=(str(question), bool(search), str(image_b64), str(mime),
+                         args=(str(question), bool(mode), depth, news, "", "",
                                return_cb, error_cb)).start()
+
+    @dbus.service.method(CHAT_IFACE, in_signature="sssu", out_signature="s",
+                         async_callbacks=("return_cb", "error_cb"))
+    def AskImage(self, question, image_b64, mime, mode, return_cb, error_cb):
+        depth, news = _decode_search_mode(mode)
+        threading.Thread(target=self._worker, daemon=True,
+                         args=(str(question), bool(mode), depth, news,
+                               str(image_b64), str(mime), return_cb, error_cb)).start()
 
     @dbus.service.method(CHAT_IFACE, out_signature="s")
     def History(self):
@@ -978,19 +1113,24 @@ class ChatInterface(dbus.service.Object):
             "search_ready": self.cfg.search_ready(),
             "llm_ready": self.cfg.llm_ready(),
             "turns": self.session.turns(),
+            "active_model": read_active_model() or "自动",
         }, ensure_ascii=False)
 
     # ------------------------------------------------------------------ 内部
 
-    def _worker(self, question, search, image_b64, mime, return_cb, error_cb):
+    def _worker(self, question, search, depth, news, image_b64, mime, return_cb, error_cb):
         cfg = self.cfg
         try:
             if not cfg.llm_ready():
                 return_cb(_reply_json(False, error="未配置 API key"))
                 return
-            job = AskJob(cfg, self.session, question, bool(search), image_b64, mime)
+            job = AskJob(cfg, self.session, question, search, image_b64, mime,
+                         search_depth=depth, search_news=news)
             answer, model_used, searched = job.wait(float(cfg.chat.get("bg_timeout", 60.0)))
-            return_cb(_reply_json(True, answer, model_used, searched))
+            sources = None
+            if searched and job.search_results:
+                sources = [[r.get("title", ""), r.get("url", "")] for r in job.search_results]
+            return_cb(_reply_json(True, answer, model_used, searched, sources=sources))
         except LLMError as exc:
             return_cb(_reply_json(False, error=str(exc)))
         except Exception:

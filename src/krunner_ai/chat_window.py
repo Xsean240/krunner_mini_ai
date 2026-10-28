@@ -69,9 +69,12 @@ class ChatApp(Gtk.Application):
         hb = Gtk.HeaderBar()
         self.win.set_titlebar(hb)
 
-        self.search_toggle = Gtk.CheckButton(label="联网")
-        self.search_toggle.set_tooltip_text("发送时先联网搜索（需配置 Tavily key）")
-        hb.pack_start(self.search_toggle)
+        self.search_mode_dd = Gtk.DropDown.new_from_strings(
+            ["仅对话", "联网", "联网·新闻", "联网·深度"])
+        self.search_mode_dd.set_selected(0)
+        self.search_mode_dd.set_tooltip_text(
+            "发送时的联网搜索模式（需 Tavily key；深度检索消耗 2 倍额度）")
+        hb.pack_start(self.search_mode_dd)
 
         reset_btn = Gtk.Button.new_from_icon_name("edit-clear")
         reset_btn.set_tooltip_text("清空上下文")
@@ -192,15 +195,16 @@ class ChatApp(Gtk.Application):
         self.on_remove_image()
         self._set_busy(True)
 
-        search = self.search_toggle.get_active()
+        search_mode = self.search_mode_dd.get_selected()
 
         def worker():
             try:
                 if img:
                     reply = self.chat.AskImage(text or "这张图片里有什么？",
-                                               img[0], img[1], search, timeout=60)
+                                               img[0], img[1], dbus.UInt32(search_mode),
+                                               timeout=60)
                 else:
-                    reply = self.chat.Ask(text, search, timeout=60)
+                    reply = self.chat.Ask(text, dbus.UInt32(search_mode), timeout=60)
                 GLib.idle_add(self._on_reply, str(reply))
             except Exception as exc:
                 GLib.idle_add(self._on_reply, json.dumps(
@@ -219,6 +223,11 @@ class ChatApp(Gtk.Application):
             if data.get("searched"):
                 meta += " · 已联网"
             self._append(f"AI（{meta}）" if meta else "AI", data.get("answer", ""), tag="ai")
+            sources = data.get("sources") or []
+            if sources:
+                lines = "\n".join(f"[{i + 1}] {t} — {u}"
+                                  for i, (t, u) in enumerate(sources[:5]))
+                self._append("", "来源：\n" + lines, tag="meta")
         else:
             self._append("AI", "✗ " + data.get("error", "未知错误"), tag="err")
         self.win.present()
@@ -306,7 +315,9 @@ class ChatApp(Gtk.Application):
         if not info.get("llm_ready"):
             self._append("", "⚠ 尚未配置 API key，对话不可用。", tag="meta")
         if not info.get("search_ready"):
-            self._append("", "提示：未配置 Tavily key，「联网」开关暂不可用。", tag="meta")
+            self._append("", "提示：未配置 Tavily key，联网搜索不可用。", tag="meta")
+        self._append("", f"当前模型：{info.get('active_model', '自动')}"
+                         f"（KRunner 输入「ai 模型」可切换）", tag="meta")
         try:
             history = json.loads(str(self.chat.History(timeout=10)))
         except Exception:
