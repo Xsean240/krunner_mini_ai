@@ -111,30 +111,68 @@ DEFAULT_CONFIG = {
     },
     "ui": {
         "trigger": "ai",
-        "search_keyword": "搜",
         "window_keywords": "窗口,chat",
-        "image_keyword": "图",
-        "model_keyword": "模型",
     },
 }
 
 
-def read_active_model() -> str:
-    """读取用户主动指定的当前模型（空串=自动/完整梯子）。文件异常时按自动处理。"""
+def _read_state() -> dict:
     try:
         with open(STATE_PATH, encoding="utf-8") as f:
-            return str(json.load(f).get("active_model", "") or "")
+            data = json.load(f)
+            return data if isinstance(data, dict) else {}
     except Exception:
-        return ""
+        return {}
 
 
-def write_active_model(name: str) -> None:
+def _write_state(data: dict) -> None:
     os.makedirs(CACHE_DIR, mode=0o700, exist_ok=True)
     tmp = STATE_PATH + ".tmp"
     with open(tmp, "w", encoding="utf-8") as f:
-        json.dump({"active_model": name}, f, ensure_ascii=False)
+        json.dump(data, f, ensure_ascii=False)
     os.replace(tmp, STATE_PATH)
     os.chmod(STATE_PATH, 0o600)
+
+
+def read_active_model() -> str:
+    """用户主动指定的当前模型（空串=自动/完整梯子）。"""
+    return str(_read_state().get("active_model", "") or "")
+
+
+def write_active_model(name: str) -> None:
+    state = _read_state()
+    state["active_model"] = name
+    _write_state(state)
+
+
+def write_pending_question(question: str) -> None:
+    """KRunner 带入窗口的待填问题。"""
+    state = _read_state()
+    state["pending_question"] = question
+    _write_state(state)
+
+
+def take_pending_question() -> str:
+    """读取并清空待填问题（窗口取走后即失效）。"""
+    state = _read_state()
+    q = str(state.pop("pending_question", "") or "")
+    if q:
+        _write_state(state)
+    return q
+
+
+def read_search_mode() -> int:
+    """窗口上次选择的搜索模式（0=仅对话 1=联网 2=新闻 3=深度）。"""
+    try:
+        return int(_read_state().get("search_mode", 0))
+    except Exception:
+        return 0
+
+
+def write_search_mode(mode: int) -> None:
+    state = _read_state()
+    state["search_mode"] = int(mode)
+    _write_state(state)
 
 
 def deep_merge(base: dict, override: dict) -> dict:
@@ -434,6 +472,7 @@ class AskJob:
         self.done = threading.Event()
         self.outcome = None            # (answer, model, searched) 或 LLMError
         self.search_results = None
+        self.search_failed = False     # 要求联网但搜索失败（fail-open 时告知用户）
         self.steps_taken: list[str] = []
         threading.Thread(target=self._run, daemon=True).start()
 
@@ -449,7 +488,8 @@ class AskJob:
                         depth=self.search_depth, news=self.search_news)
                     searched = True
                 except Exception as exc:
-                    log.info("搜索失败(fail-open): %s", type(exc).__name__)
+                    self.search_failed = True
+                    log.info("搜索失败(fail-open): %s: %s", type(exc).__name__, exc)
             elif self.want_search:
                 log.info("要求联网但 search 未配置，退化为纯模型回答")
 
@@ -578,55 +618,26 @@ def load_image_b64(path: str) -> tuple[str, str]:
 
 @dataclass
 class ParsedQuery:
-    kind: str  # help | window | reset | ping | model_panel | ask | ask_search | ask_image
+    kind: str  # help | window | ping | reset | bring（bring=带着问题文本打开窗口）
     body: str = ""
-    image_path: str = ""
-    search_depth: str = "basic"   # basic | advanced（ai 搜 深）
-    search_news: bool = False     # True 表示新闻专题搜索（ai 搜 新闻）
 
 
-def parse_query(raw: str, trigger: str, search_keyword: str,
-                window_keywords: tuple = (), image_keyword: str = "图",
-                model_keyword: str = "模型") -> ParsedQuery:
+def parse_query(raw: str, trigger: str, window_keywords: tuple = ()) -> ParsedQuery:
+    """KRunner 端只负责唤起窗口：除 ping/reset 外，任何文本都作为待带入窗口的问题。"""
     text = raw.strip()
-    # KRunner 单 runner 模式可能传入已去掉触发词的剩余部分，两种都兼容
     if text.lower().startswith(trigger.lower() + " "):
         text = text[len(trigger) + 1:].strip()
     elif text.lower() == trigger.lower():
         text = ""
     if not text:
         return ParsedQuery(kind="help")
+    if text.lower() in ("ping",):
+        return ParsedQuery(kind="ping")
     if text.lower() in ("reset", "清空", "重置"):
         return ParsedQuery(kind="reset")
-    if text.lower() == "ping":
-        return ParsedQuery(kind="ping")
     if text.lower() in window_keywords:
         return ParsedQuery(kind="window")
-    if model_keyword and (text == model_keyword or text.startswith(model_keyword + " ")):
-        return ParsedQuery(kind="model_panel", body=text[len(model_keyword):].strip())
-    if search_keyword and text.startswith(search_keyword + " "):
-        rest = text[len(search_keyword) + 1:].strip()
-        depth, news = "basic", False
-        # 可选前置修饰词：新闻/news（新闻专题）、深/深度/advanced（深度检索，消耗 2 倍额度）
-        while rest:
-            tok, _, remain = rest.partition(" ")
-            if tok in ("新闻", "news"):
-                news, rest = True, remain.strip()
-                continue
-            if tok in ("深", "深度", "advanced"):
-                depth, rest = "advanced", remain.strip()
-                continue
-            break
-        if rest:
-            return ParsedQuery(kind="ask_search", body=rest, search_depth=depth, search_news=news)
-    if image_keyword and text.startswith(image_keyword + " "):
-        rest = text[len(image_keyword) + 1:].strip()
-        # 格式：图 <路径> <问题>；路径中的空格用引号包裹即可
-        m = re.match(r'^(?:"([^"]+)"|\'([^\']+)\'|(\S+))\s*(.*)$', rest)
-        if m:
-            path = m.group(1) or m.group(2) or m.group(3)
-            return ParsedQuery(kind="ask_image", body=m.group(4).strip(), image_path=path)
-    return ParsedQuery(kind="ask", body=text)
+    return ParsedQuery(kind="bring", body=text)
 
 
 def summarize_answer(answer: str, limit: int = 160) -> str:
@@ -712,19 +723,11 @@ class RunnerService(dbus.service.Object):
         self.session = session
 
         self._state_lock = threading.Lock()
-        self._current_query: str | None = None   # 防抖：最后一次收到的查询
-        self._busy = False                        # 是否有生成任务在进行
-        self._answers: OrderedDict[str, str] = OrderedDict()  # matchId -> 全文
-        self._urls: dict[str, str] = {}           # matchId -> 来源 URL
-        self._answer_seq = 0
 
-    # -- org.kde.krunner1.Actions: (id, 名称, 图标) --------------------------
+    # -- org.kde.krunner1.Actions: 无条目级动作（KRunner 仅作窗口启动器） ----------
     @dbus.service.method(IFACE, out_signature="a(sss)")
     def Actions(self):
-        return [
-            ("copy", "复制全文", "edit-copy"),
-            ("view", "查看全文", "document-open"),
-        ]
+        return []
 
     # -- org.kde.krunner1.Match ----------------------------------------------
     @dbus.service.method(
@@ -751,34 +754,6 @@ class RunnerService(dbus.service.Object):
         pass
 
     # ------------------------------------------------------------------ 内部
-
-    def _register_query(self, body: str) -> None:
-        with self._state_lock:
-            self._current_query = body
-
-    def _is_latest(self, body: str) -> bool:
-        with self._state_lock:
-            return self._current_query == body
-
-    def _acquire_busy(self) -> bool:
-        with self._state_lock:
-            if self._busy:
-                return False
-            self._busy = True
-            return True
-
-    def _release_busy(self) -> None:
-        with self._state_lock:
-            self._busy = False
-
-    def _store_answer(self, text: str) -> str:
-        with self._state_lock:
-            self._answer_seq += 1
-            mid = f"ans{self._answer_seq}"
-            self._answers[mid] = text
-            while len(self._answers) > 8:
-                self._answers.popitem(last=False)
-            return mid
 
     def _focus_or_spawn_window(self):
         # 已开则置前（org.freedesktop.Application.Activate 需要 a{sv} 平台数据参数）
@@ -820,229 +795,53 @@ class RunnerService(dbus.service.Object):
     def _handle(self, raw_query: str):
         cfg = self.cfg
         ui = cfg.ui
-        parsed = parse_query(raw_query,
-                             ui.get("trigger", "ai"),
-                             ui.get("search_keyword", "搜"),
-                             tuple(k.strip() for k in ui.get("window_keywords", "窗口").split(",") if k.strip()),
-                             ui.get("image_keyword", "图"),
-                             ui.get("model_keyword", "模型"))
-
+        parsed = parse_query(
+            raw_query, ui.get("trigger", "ai"),
+            tuple(k.strip() for k in ui.get("window_keywords", "窗口").split(",") if k.strip()))
+        win = self._info_match("open-chat", "💬 打开 AI 对话窗口", "dev.local.krunnerai",
+                               "持续对话 · 支持图片 · 与 KRunner 共享上下文", mtype=0)
         if parsed.kind == "help":
-            return self._help_matches()
+            return [win] + self._help_matches()
         if parsed.kind == "window":
-            return [self._info_match("open-chat", "💬 打开 AI 对话窗口", "dev.local.krunnerai",
-                                     "持续对话 · 支持图片 · 与 KRunner 共享上下文", mtype=0)]
-        if parsed.kind == "model_panel":
-            panel = self._model_panel(parsed.body)
-            if panel is not None:
-                return panel
-            # 筛选词没命中任何模型：当作普通提问（把"模型"还给问题原文）
-            parsed = ParsedQuery(kind="ask",
-                                 body=ui.get("model_keyword", "模型") + " " + parsed.body)
+            return [win]
+        if parsed.kind == "bring":
+            # KRunner 只是入口：文本带回窗口填入输入框，不自动发送（用户按回车才算数）
+            return [self._info_match("open-chat|" + parsed.body, "💬 打开 AI 对话窗口",
+                                     "dev.local.krunnerai",
+                                     f"带入提问：{parsed.body[:80]}（不自动发送）", mtype=0)]
         if parsed.kind == "reset":
             self.session.clear()
             return [self._info_match("reset-done", "✓ 上下文已清空", "edit-clear",
-                                     f"当前上下文 0 轮 · 模型 {cfg.llm.get('model')}")]
+                                     f"当前上下文 0 轮 · 模型 {read_active_model() or cfg.llm.get('model')}")]
         if parsed.kind == "ping":
             return [self._info_match("ping", "krunner-ai 在线 ✓", "tools-check-drawing",
                                      f"模型 {'已配置' if cfg.llm_ready() else '未配置 key'} · "
                                      f"联网 {'可用' if cfg.search_ready() else '未配置 key'} · "
                                      f"上下文 {self.session.turns()} 轮")]
-        if parsed.kind == "ask_image" and not cfg.llm_ready():
-            return [self._info_match("nokey", "未配置模型 API key", "dialog-error",
-                                     "编辑 ~/.config/krunner-ai/config.toml 填入 llm.api_key 后 "
-                                     "systemctl --user restart krunner-ai")]
-
-        # 提问类：先登记查询用于防抖
-        self._register_query(parsed.body)
-        debounce = float(cfg.chat.get("debounce_ms", 800)) / 1000.0
-        time.sleep(debounce)
-        if not self._is_latest(parsed.body):
-            return []  # 用户还在打字，本次查询已过期
-
-        if not cfg.llm_ready():
-            return [self._info_match("nokey", "未配置模型 API key", "dialog-error",
-                                     "编辑 ~/.config/krunner-ai/config.toml 填入 llm.api_key 后 "
-                                     "systemctl --user restart krunner-ai")]
-
-        if not self._acquire_busy():
-            return [self._info_match("busy", "上一回答仍在生成…", "view-refresh",
-                                     "完成后会以系统通知送达并自动复制全文")]
-
-        started = time.monotonic()
-        deadline = started + float(cfg.chat.get("match_deadline", 18.0))
-        try:
-            return self._generate(parsed, deadline, started)
-        finally:
-            self._release_busy()
-
-    def _generate(self, parsed, deadline: float, started: float):
-        cfg = self.cfg
-        want_search = parsed.kind == "ask_search" or (
-            bool(cfg.chat.get("auto_search")) and looks_like_search_needed(parsed.body)
-        )
-
-        image_b64 = image_mime = ""
-        display_q = parsed.body
-        if parsed.kind == "ask_image":
-            try:
-                image_b64, image_mime = load_image_b64(parsed.image_path)
-            except ValueError as exc:
-                return [self._info_match("imgerr", f"✗ {exc}", "dialog-error",
-                                         "格式：ai 图 /路径/图片.png 问题（支持 png/jpg/webp/bmp/gif）")]
-            display_q = parsed.body or "（描述这张图片）"
-
-        # 2) LLM：AskJob 内部按梯子流式尝试；赶不上 Match 预算则同一请求转后台
-        remaining = deadline - time.monotonic()
-        if remaining <= 1.5:
-            return self._spawn_background(display_q, want_search, image_b64, image_mime)
-
-        job = AskJob(cfg, self.session, display_q, want_search, image_b64, image_mime,
-                     search_depth=parsed.search_depth, search_news=parsed.search_news)
-        try:
-            answer, model_used, searched = job.wait(remaining)
-        except AskTimeout as timeout_exc:
-            # KRunner 等不及了：同一请求转后台继续，不重复发起
-            return self._spawn_background_job(timeout_exc.job)
-        except LLMError as exc:
-            hint = str(exc)
-            if job.steps_taken:
-                tried = " → ".join(s.split(":")[0] for s in job.steps_taken)
-                hint += f"（已尝试: {tried}）"
-            return [self._info_match("error", f"✗ {hint}", "dialog-error",
-                                     f"主模型 {cfg.llm.get('model')}")]
-
-        mid = self._store_answer(answer)
-        meta = (f"{model_used} · 上下文 {self.session.turns()} 轮 · 回车复制全文"
-                + (" · 已联网" if searched else ""))
-        matches = [self._answer_match(mid, answer, meta)]
-        matches.extend(self._source_matches(job.search_results))
-        log.info("问答完成 耗时%.1fs 联网=%s 图片=%s 字数=%d 尝试级数=%d",
-                 time.monotonic() - started, searched, bool(image_b64), len(answer),
-                 len(job.steps_taken) + 1)
-        return matches
-
-    def _spawn_background(self, question, want_search, image_b64="", image_mime=""):
-        return self._spawn_background_job(
-            AskJob(self.cfg, self.session, question, want_search, image_b64, image_mime))
-
-    def _spawn_background_job(self, job: AskJob):
-        threading.Thread(target=self._watch_job, args=(job,), daemon=True).start()
-        return [self._info_match("bg", "⏳ 响应较慢，已转后台…", "view-refresh",
-                                 "同一请求继续生成，完成后弹通知并自动复制全文")]
-
-    def _watch_job(self, job: AskJob):
-        cfg = self.cfg
-        try:
-            answer, model_used, _searched = job.wait(float(cfg.chat.get("bg_timeout", 60.0)))
-            self._store_answer(answer)
-            copied = klipper_set_clipboard(self.bus, answer)
-            body = answer[:280] + ("…" if len(answer) > 280 else "")
-            if not copied:
-                body += "\n（自动复制失败）"
-            if model_used != cfg.llm.get("model"):
-                body = f"[{model_used}] " + body
-            notify(self.bus, "KRunner AI 回答（已生成）", body)
-        except AskTimeout:
-            notify(self.bus, "KRunner AI 回答超时",
-                   "后台等待超时，请稍后重试（详见 journalctl --user -u krunner-ai）")
-        except LLMError as exc:
-            notify(self.bus, "KRunner AI 回答失败", str(exc))
+        return [win]
 
     # -- Run 的本地固定动作（不解析、不执行模型输出中的任何"指令"） -----------
-    def _model_panel(self, filter_text: str):
-        """`ai 模型 [筛选]`：列出可切换模型。筛选无命中返回 None（回退为普通提问）。"""
-        entries = model_panel_entries(self.cfg.llm, read_active_model())
-        hits = match_model_entries(entries, filter_text)
-        if hits is None:
-            return None
-        matches = []
-        for e in hits:
-            mark = "✓ " if e["current"] else ""
-            title = f"{mark}{e['label']}"
-            sub = "当前使用中" if e["current"] else "回车切换为当前模型（梯子自动降级为兜底）"
-            icon = "starred" if e["current"] else "dev.local.krunnerai"
-            matches.append(self._info_match(f"setmodel|{e['model']}", title, icon, sub, mtype=0))
-        return matches
-
     def _run(self, match_id: str, action_id: str):
-        if match_id.startswith("setmodel|"):
-            name = match_id.split("|", 1)[1]
-            write_active_model(name)
-            label = name if name else "自动（完整梯子）"
-            notify(self.bus, "已切换模型", f"当前: {label}\n下次提问生效；失败时梯子自动兜底")
-            return
-        if match_id == "open-chat":
+        if match_id.startswith("open-chat"):
+            question = match_id.split("|", 1)[1] if "|" in match_id else ""
+            if question:
+                write_pending_question(question)
             self._focus_or_spawn_window()
             return
-        if match_id.startswith("ans"):
-            text = self._answers.get(match_id, "")
-            if not text:
-                return
-            if action_id == "view":
-                if not show_text_window(text):
-                    notify(self.bus, "查看全文失败", "服务环境缺少显示变量，已改为复制到剪贴板")
-                    klipper_set_clipboard(self.bus, text)
-                return
-            # 默认动作（action_id 为空或 copy）
-            ok = klipper_set_clipboard(self.bus, text)
-            notify(self.bus, "已复制回答全文" if ok else "复制失败",
-                   summarize_answer(text, 120), 4000)
-            return
-        if match_id.startswith("src"):
-            url = self._urls.get(match_id)
-            if url and not open_url(self.bus, url):
-                klipper_set_clipboard(self.bus, url)
-                notify(self.bus, "已复制来源链接", url, 4000)
 
     # -- match 构造 -----------------------------------------------------------
-
-    def _answer_match(self, mid: str, answer: str, subtext: str):
-        props = {
-            "subtext": dbus.String(subtext),
-            "isMultiLine": dbus.Boolean(False),
-            "actions": dbus.Array([dbus.String("copy"), dbus.String("view")], signature="s"),
-        }
-        return (dbus.String(mid), dbus.String(summarize_answer(answer)),
-                dbus.String("dev.local.krunnerai"), dbus.Int32(0), dbus.Double(1.0), props)
 
     def _info_match(self, mid: str, title: str, icon: str, subtext: str = "", mtype: int = 2):
         props = {"subtext": dbus.String(subtext)} if subtext else {}
         return (dbus.String(mid), dbus.String(title), dbus.String(icon),
                 dbus.Int32(mtype), dbus.Double(0.8), props)
 
-    def _source_matches(self, search_results):
-        out = []
-        if not search_results:
-            return out
-        for i, r in enumerate(search_results):
-            sid = f"src{i}"
-            self._urls[sid] = r["url"]
-            props = {
-                "subtext": dbus.String(r["url"]),
-                "urls": dbus.Array([dbus.String(r["url"])], signature="s"),
-                "category": dbus.String("网页来源"),
-            }
-            out.append((dbus.String(sid), dbus.String(f"[{i + 1}] {r['title'][:80]}"),
-                        dbus.String("internet-web-browser"), dbus.Int32(2),
-                        dbus.Double(0.5), props))
-        return out
-
     def _help_matches(self):
-        cfg = self.cfg
-        t = cfg.ui.get("trigger", "ai")
-        sk = cfg.ui.get("search_keyword", "搜")
-        ik = cfg.ui.get("image_keyword", "图")
+        t = self.cfg.ui.get("trigger", "ai")
         lines = [
-            (f"{t} <问题> — 提问（自动携带上下文）", "edit-copy", ""),
-            (f"{t} {sk} <问题> — 联网搜索后回答（{sk} 新闻 …/ {sk} 深 …）", "internet-web-browser", ""),
-            (f"{t} 模型 — 查看/切换当前模型", "starred", ""),
-            (f"{t} 窗口 — 打开持续对话小窗口（支持图片）", "dev.local.krunnerai", ""),
-            (f"{t} {ik} /路径/图片.png <问题> — 图片理解", "emblem-photos", ""),
+            (f"{t} <问题> — 打开窗口并带入该问题（不自动发送）", "dev.local.krunnerai", ""),
             (f"{t} reset — 清空上下文（当前 {self.session.turns()} 轮）", "edit-clear", ""),
-            (f"状态：模型 {read_active_model() or cfg.llm.get('model')} "
-             f"({'key 已配置' if cfg.llm_ready() else '缺 key'}) · "
-             f"联网 {'可用' if cfg.search_ready() else '缺 key'})", "dialog-information", ""),
+            (f"{t} ping — 健康自检", "tools-check-drawing", ""),
         ]
         return [
             (dbus.String(f"help{i}"), dbus.String(title), dbus.String(icon),
@@ -1056,10 +855,12 @@ class RunnerService(dbus.service.Object):
 # ---------------------------------------------------------------------------
 
 def _reply_json(ok: bool, answer: str = "", model: str = "", searched: bool = False,
-                error: str = "", sources: list | None = None) -> str:
+                error: str = "", sources: list | None = None,
+                search_failed: bool = False) -> str:
     return json.dumps({"ok": ok, "answer": answer, "model": model,
                        "searched": searched, "error": error,
-                       "sources": sources or []}, ensure_ascii=False)
+                       "sources": sources or [], "search_failed": search_failed},
+                      ensure_ascii=False)
 
 
 def _decode_search_mode(mode) -> tuple[str, bool]:
@@ -1114,7 +915,27 @@ class ChatInterface(dbus.service.Object):
             "llm_ready": self.cfg.llm_ready(),
             "turns": self.session.turns(),
             "active_model": read_active_model() or "自动",
+            "search_mode": read_search_mode(),
         }, ensure_ascii=False)
+
+    @dbus.service.method(CHAT_IFACE, out_signature="s")
+    def Models(self):
+        """可切换模型列表（含"自动"），标注当前选择，供窗口下拉框使用。"""
+        return json.dumps(model_panel_entries(self.cfg.llm, read_active_model()),
+                          ensure_ascii=False)
+
+    @dbus.service.method(CHAT_IFACE, in_signature="s")
+    def SetModel(self, name):
+        write_active_model(str(name))
+
+    @dbus.service.method(CHAT_IFACE, in_signature="u")
+    def SetSearchMode(self, mode):
+        write_search_mode(int(mode))
+
+    @dbus.service.method(CHAT_IFACE, out_signature="s")
+    def TakePending(self):
+        """取走 KRunner 带入的待填问题（读后即清）。"""
+        return take_pending_question()
 
     # ------------------------------------------------------------------ 内部
 
@@ -1130,7 +951,8 @@ class ChatInterface(dbus.service.Object):
             sources = None
             if searched and job.search_results:
                 sources = [[r.get("title", ""), r.get("url", "")] for r in job.search_results]
-            return_cb(_reply_json(True, answer, model_used, searched, sources=sources))
+            return_cb(_reply_json(True, answer, model_used, searched,
+                                  sources=sources, search_failed=job.search_failed))
         except LLMError as exc:
             return_cb(_reply_json(False, error=str(exc)))
         except Exception:

@@ -57,6 +57,7 @@ class ChatApp(Gtk.Application):
             self.win.present_with_time(GLib.get_real_time() // 1000)
         except Exception:
             self.win.present()
+        self._take_pending()   # 取走 KRunner 带入的问题填入输入框（不自动发送）
 
     def _build(self):
         self.chat = get_chat_iface()
@@ -69,11 +70,21 @@ class ChatApp(Gtk.Application):
         hb = Gtk.HeaderBar()
         self.win.set_titlebar(hb)
 
+        # 模型选择（内容从守护服务拉取：自动/智谱/魔搭…）
+        self.model_dd = Gtk.DropDown.new_from_strings(["模型…"])
+        self.model_dd.set_tooltip_text("切换当前模型（梯子自动降级为兜底）")
+        self._model_entries = []
+        self._model_ready = False
+        self.model_dd.connect("notify::selected", self._on_model_changed)
+        hb.pack_start(self.model_dd)
+
         self.search_mode_dd = Gtk.DropDown.new_from_strings(
             ["仅对话", "联网", "联网·新闻", "联网·深度"])
         self.search_mode_dd.set_selected(0)
         self.search_mode_dd.set_tooltip_text(
-            "发送时的联网搜索模式（需 Tavily key；深度检索消耗 2 倍额度）")
+            "发送时的联网搜索模式（需 Tavily key；深度检索消耗 2 倍额度），选择会被记住")
+        self._search_mode_ready = False
+        self.search_mode_dd.connect("notify::selected", self._on_search_mode_changed)
         hb.pack_start(self.search_mode_dd)
 
         reset_btn = Gtk.Button.new_from_icon_name("edit-clear")
@@ -222,7 +233,11 @@ class ChatApp(Gtk.Application):
             meta = data.get("model", "")
             if data.get("searched"):
                 meta += " · 已联网"
+            if data.get("search_failed"):
+                meta += " · 联网失败"
             self._append(f"AI（{meta}）" if meta else "AI", data.get("answer", ""), tag="ai")
+            if data.get("search_failed"):
+                self._append("", "⚠ 本次联网搜索失败，回答基于模型自身知识", tag="meta")
             sources = data.get("sources") or []
             if sources:
                 lines = "\n".join(f"[{i + 1}] {t} — {u}"
@@ -303,6 +318,75 @@ class ChatApp(Gtk.Application):
         self.image = None
         self.chip_box.set_visible(False)
 
+    # ------------------------------------------------------- 模型/模式/带入
+
+    def _setup_models(self):
+        """从守护服务拉取可切换模型列表填充下拉框，并定位到当前选择。"""
+        def worker():
+            try:
+                entries = json.loads(str(self.chat.Models(timeout=10)))
+            except Exception:
+                entries = []
+            def apply():
+                sl = self.model_dd.get_model()
+                self._model_entries = entries
+                current = 0
+                for i, e in enumerate(entries):
+                    sl.append(e.get("label", "?"))
+                    if e.get("current"):
+                        current = i
+                self._model_ready = True
+                if entries:
+                    self.model_dd.set_selected(current)
+                return False
+            GLib.idle_add(apply)
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_model_changed(self, *_):
+        if not self._model_ready:
+            return
+        idx = self.model_dd.get_selected()
+        entries = self._model_entries
+        if not entries or idx >= len(entries):
+            return
+        chosen = entries[idx]
+        name, label = chosen.get("model", ""), chosen.get("label", "?")
+        def worker():
+            try:
+                self.chat.SetModel(name, timeout=5)
+            except Exception:
+                return
+            GLib.idle_add(self._append, "",
+                          f"已切换模型：{label}（失败时梯子自动兜底）", "meta")
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _on_search_mode_changed(self, *_):
+        if not self._search_mode_ready:
+            return
+        mode = int(self.search_mode_dd.get_selected())
+        def worker():
+            try:
+                self.chat.SetSearchMode(dbus.UInt32(mode), timeout=5)
+            except Exception:
+                pass
+        threading.Thread(target=worker, daemon=True).start()
+
+    def _take_pending(self):
+        """取走 KRunner 带入的待填问题，填入输入框（不自动发送）。"""
+        def worker():
+            try:
+                q = str(self.chat.TakePending(timeout=5))
+            except Exception:
+                q = ""
+            if q:
+                def apply():
+                    self.entry.set_text(q)
+                    self.entry.grab_focus()
+                    self.entry.set_position(-1)
+                    return False
+                GLib.idle_add(apply)
+        threading.Thread(target=worker, daemon=True).start()
+
     # ------------------------------------------------------------------ 初始
 
     def _load_history(self):
@@ -316,8 +400,14 @@ class ChatApp(Gtk.Application):
             self._append("", "⚠ 尚未配置 API key，对话不可用。", tag="meta")
         if not info.get("search_ready"):
             self._append("", "提示：未配置 Tavily key，联网搜索不可用。", tag="meta")
-        self._append("", f"当前模型：{info.get('active_model', '自动')}"
-                         f"（KRunner 输入「ai 模型」可切换）", tag="meta")
+        self._append("", f"当前模型：{info.get('active_model', '自动')}", tag="meta")
+        # 恢复上次搜索模式选择，之后再启用"变化即保存"
+        try:
+            self.search_mode_dd.set_selected(int(info.get("search_mode", 0)) % 4)
+        except Exception:
+            pass
+        self._search_mode_ready = True
+        self._setup_models()
         try:
             history = json.loads(str(self.chat.History(timeout=10)))
         except Exception:

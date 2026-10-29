@@ -13,8 +13,8 @@ X-Plasma-DBusRunner-Path=/ai
 X-Plasma-Request-Actions-Once=true
 X-Plasma-AdvertiseSingleRunnerQueryMode=true
 
-X-Plasma-Runner-Syntaxes=ai :q:,ai 搜 :q:,ai 图 :q:,ai 窗口,ai reset,ai ping
-X-Plasma-Runner-Syntax-Descriptions=Ask the AI with conversation context,Search the web first then answer,Ask about an image file path,Open the persistent chat window,Clear conversation context,Health check
+X-Plasma-Runner-Syntaxes=ai,ai 窗口,ai :q:,ai ping,ai reset
+X-Plasma-Runner-Syntax-Descriptions=Open the AI chat window,Open the AI chat window,Bring the question into the AI chat window,Health check,Clear conversation context
 
 X-KDE-PluginInfo-Author=Xsean240
 X-KDE-PluginInfo-Email=xsean240@users.noreply.github.com

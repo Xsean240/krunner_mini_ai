@@ -15,59 +15,35 @@ import daemon  # noqa: E402
 
 
 class TestParseQuery(unittest.TestCase):
+    """KRunner 端只负责唤起窗口：除 ping/reset 外任何文本都带入窗口。"""
+
     def test_bare_trigger(self):
-        self.assertEqual(daemon.parse_query("ai", "ai", "搜").kind, "help")
-        self.assertEqual(daemon.parse_query("ai ", "ai", "搜").kind, "help")
-
-    def test_trigger_with_body(self):
-        p = daemon.parse_query("ai 你好", "ai", "搜")
-        self.assertEqual(p.kind, "ask")
-        self.assertEqual(p.body, "你好")
-
-    def test_body_without_trigger(self):
-        # KRunner 单 runner 模式下可能只传剩余部分
-        p = daemon.parse_query("什么是量子纠缠", "ai", "搜")
-        self.assertEqual(p.kind, "ask")
-        self.assertEqual(p.body, "什么是量子纠缠")
-
-    def test_search_keyword(self):
-        p = daemon.parse_query("ai 搜 DeepSeek 最新消息", "ai", "搜")
-        self.assertEqual(p.kind, "ask_search")
-        self.assertEqual(p.body, "DeepSeek 最新消息")
-
-    def test_reset_variants(self):
-        for q in ("ai reset", "ai 清空", "ai 重置"):
-            self.assertEqual(daemon.parse_query(q, "ai", "搜").kind, "reset", q)
-
-    def test_ping(self):
-        self.assertEqual(daemon.parse_query("ai ping", "ai", "搜").kind, "ping")
+        self.assertEqual(daemon.parse_query("ai", "ai").kind, "help")
+        self.assertEqual(daemon.parse_query("ai ", "ai").kind, "help")
 
     def test_window_keywords(self):
         for q in ("ai 窗口", "ai chat", "ai Chat"):
-            self.assertEqual(
-                daemon.parse_query(q, "ai", "搜", ("窗口", "chat")).kind, "window", q)
+            self.assertEqual(daemon.parse_query(q, "ai", ("窗口", "chat")).kind, "window", q)
 
-    def test_image_keyword(self):
-        p = daemon.parse_query("ai 图 /tmp/pic.png 这是什么", "ai", "搜", (), "图")
-        self.assertEqual(p.kind, "ask_image")
-        self.assertEqual(p.image_path, "/tmp/pic.png")
-        self.assertEqual(p.body, "这是什么")
+    def test_ping_and_reset(self):
+        self.assertEqual(daemon.parse_query("ai ping", "ai").kind, "ping")
+        for q in ("ai reset", "ai 清空", "ai 重置"):
+            self.assertEqual(daemon.parse_query(q, "ai").kind, "reset", q)
 
-    def test_image_quoted_path_with_spaces(self):
-        p = daemon.parse_query('ai 图 "/tmp/my pic.png" 描述', "ai", "搜", (), "图")
-        self.assertEqual(p.kind, "ask_image")
-        self.assertEqual(p.image_path, "/tmp/my pic.png")
-        self.assertEqual(p.body, "描述")
+    def test_any_text_becomes_bring(self):
+        p = daemon.parse_query("ai 什么是量子纠缠", "ai")
+        self.assertEqual((p.kind, p.body), ("bring", "什么是量子纠缠"))
+        # 旧的子命令文本也原样带入窗口（不再在 KRunner 内解析）
+        p2 = daemon.parse_query("ai 搜 新闻 芯片", "ai")
+        self.assertEqual((p2.kind, p2.body), ("bring", "搜 新闻 芯片"))
+
+    def test_body_without_trigger(self):
+        p = daemon.parse_query("hello world", "ai")
+        self.assertEqual((p.kind, p.body), ("bring", "hello world"))
 
     def test_case_insensitive_trigger(self):
-        p = daemon.parse_query("AI Hello", "ai", "搜")
-        self.assertEqual(p.kind, "ask")
+        p = daemon.parse_query("AI Hello", "ai")
         self.assertEqual(p.body, "Hello")
-
-    def test_search_keyword_alone_falls_back_to_ask(self):
-        p = daemon.parse_query("ai 搜", "ai", "搜")
-        self.assertEqual(p.kind, "ask")
-        self.assertEqual(p.body, "搜")
 
 
 class TestSession(unittest.TestCase):
@@ -202,29 +178,6 @@ class TestAttemptLadder(unittest.TestCase):
             "base_url": "https://modelscope/v1", "api_key": "ms-key", "model": "ds"})
         self.assertEqual([s["attempt_model"] for s in
                           daemon.build_attempt_ladder(no_vs, "vision_model")], ["glm-4v-flash"])
-
-
-class TestSearchModeParse(unittest.TestCase):
-    def test_plain(self):
-        p = daemon.parse_query("ai 搜 量子计算", "ai", "搜")
-        self.assertEqual((p.kind, p.search_depth, p.search_news), ("ask_search", "basic", False))
-
-    def test_news(self):
-        p = daemon.parse_query("ai 搜 新闻 量子计算", "ai", "搜")
-        self.assertEqual((p.search_depth, p.search_news, p.body), ("basic", True, "量子计算"))
-
-    def test_advanced(self):
-        p = daemon.parse_query("ai 搜 深度 对比RFC", "ai", "搜")
-        self.assertEqual((p.search_depth, p.search_news, p.body), ("advanced", False, "对比RFC"))
-
-    def test_news_and_advanced_combined(self):
-        p = daemon.parse_query("ai 搜 新闻 深 芯片出口", "ai", "搜")
-        self.assertEqual((p.search_depth, p.search_news, p.body), ("advanced", True, "芯片出口"))
-
-    def test_model_panel_parse(self):
-        self.assertEqual(daemon.parse_query("ai 模型", "ai", "搜").kind, "model_panel")
-        p = daemon.parse_query("ai 模型 glm", "ai", "搜")
-        self.assertEqual((p.kind, p.body), ("model_panel", "glm"))
 
 
 class TestTavilyBody(unittest.TestCase):
