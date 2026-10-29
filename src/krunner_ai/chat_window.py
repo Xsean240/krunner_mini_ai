@@ -79,10 +79,10 @@ class ChatApp(Gtk.Application):
         hb.pack_start(self.model_dd)
 
         self.search_mode_dd = Gtk.DropDown.new_from_strings(
-            ["仅对话", "联网", "联网·新闻", "联网·深度"])
+            ["仅对话", "联网", "联网·新闻", "联网·深度", "联网·自动"])
         self.search_mode_dd.set_selected(0)
         self.search_mode_dd.set_tooltip_text(
-            "发送时的联网搜索模式（需 Tavily key；深度检索消耗 2 倍额度），选择会被记住")
+            "发送时的联网搜索模式（需 Tavily key；深度=2倍额度；自动=按需联网，情景识别），选择会被记住")
         self._search_mode_ready = False
         self.search_mode_dd.connect("notify::selected", self._on_search_mode_changed)
         hb.pack_start(self.search_mode_dd)
@@ -403,7 +403,7 @@ class ChatApp(Gtk.Application):
         self._append("", f"当前模型：{info.get('active_model', '自动')}", tag="meta")
         # 恢复上次搜索模式选择，之后再启用"变化即保存"
         try:
-            self.search_mode_dd.set_selected(int(info.get("search_mode", 0)) % 4)
+            self.search_mode_dd.set_selected(int(info.get("search_mode", 0)) % 5)
         except Exception:
             pass
         self._search_mode_ready = True

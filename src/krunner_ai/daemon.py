@@ -458,7 +458,8 @@ class AskJob:
 
     def __init__(self, cfg: Config, session: Session, question: str, want_search: bool,
                  image_b64: str = "", image_mime: str = "", on_chunk=None,
-                 search_depth: str = "basic", search_news: bool = False, active: str | None = None):
+                 search_depth: str = "basic", search_news: bool = False,
+                 search_auto: bool = False, active: str | None = None):
         self.cfg = cfg
         self.session = session
         self.question = question
@@ -468,6 +469,7 @@ class AskJob:
         self.on_chunk = on_chunk
         self.search_depth = search_depth
         self.search_news = search_news
+        self.search_auto = search_auto
         self.active = read_active_model() if active is None else active
         self.done = threading.Event()
         self.outcome = None            # (answer, model, searched) 或 LLMError
@@ -478,18 +480,25 @@ class AskJob:
 
     def _run(self):
         cfg = self.cfg
+        started = time.monotonic()
         try:
             searched = False
             if self.want_search and cfg.search_ready():
-                try:
-                    self.search_results = tavily_search(
-                        cfg.search, self.question,
-                        min(float(cfg.search.get("timeout", 5.0)), 6.0),
-                        depth=self.search_depth, news=self.search_news)
-                    searched = True
-                except Exception as exc:
-                    self.search_failed = True
-                    log.info("搜索失败(fail-open): %s: %s", type(exc).__name__, exc)
+                do_search = True
+                if self.search_auto:
+                    do_search = classify_need_search(cfg, self.question)
+                    if not do_search:
+                        log.info("情景识别: 无需联网，直接回答")
+                if do_search:
+                    try:
+                        self.search_results = tavily_search(
+                            cfg.search, self.question,
+                            min(float(cfg.search.get("timeout", 5.0)), 6.0),
+                            depth=self.search_depth, news=self.search_news)
+                        searched = True
+                    except Exception as exc:
+                        self.search_failed = True
+                        log.info("搜索失败(fail-open): %s: %s", type(exc).__name__, exc)
             elif self.want_search:
                 log.info("要求联网但 search 未配置，退化为纯模型回答")
 
@@ -515,10 +524,15 @@ class AskJob:
                     answer = None
             if answer is None:
                 self.outcome = last_err or LLMError("没有可用的模型配置")
+                log.warning("问答失败 耗时%.1fs 路径=%s",
+                            time.monotonic() - started, self.steps_taken)
             else:
                 user_text = ("[图片] " + self.question) if self.image_b64 else self.question
                 self.session.add_turn(user_text, answer)
                 self.outcome = (answer, model_used, searched)
+                log.info("问答完成 模型=%s 耗时%.1fs 联网=%s 自动判定=%s 字数=%d 尝试级数=%d",
+                         model_used, time.monotonic() - started, searched,
+                         self.search_auto, len(answer), len(self.steps_taken) + 1)
         except Exception:
             log.exception("AskJob 内部异常")
             self.outcome = LLMError("内部错误")
@@ -863,14 +877,55 @@ def _reply_json(ok: bool, answer: str = "", model: str = "", searched: bool = Fa
                       ensure_ascii=False)
 
 
-def _decode_search_mode(mode) -> tuple[str, bool]:
-    """窗口传入的模式编号 → (search_depth, news)。0=不搜 1=基础 2=新闻 3=深度。"""
+def _decode_search_mode(mode) -> tuple[str, bool, bool]:
+    """窗口传入的模式编号 → (search_depth, news, auto)。
+    0=不搜 1=基础 2=新闻 3=深度 4=自动（情景识别，必要时才搜）。"""
     mode = int(mode)
     if mode == 2:
-        return "basic", True
+        return "basic", True, False
     if mode == 3:
-        return "advanced", False
-    return "basic", False
+        return "advanced", False, False
+    if mode == 4:
+        return "basic", False, True
+    return "basic", False, False
+
+
+def should_search_fast(question: str):
+    """情景识别的启发式快通道：True/False 直接定论，None 表示拿不准需模型判定。"""
+    if looks_like_search_needed(question):
+        return True
+    if any(question.strip().startswith(k) for k in
+           ("写", "帮我写", "翻译", "润色", "改写", "总结", "解释", "起", "生成",
+            "计算", "编", "模仿", "续写", "帮我看看这段", "修改")):
+        return False
+    if any(k in question for k in ("是什么意思", "怎么办", "如何学习", "推荐一些", "你好", "谢谢")):
+        return False
+    return None
+
+
+def classify_need_search(cfg: Config, question: str) -> bool:
+    """情景识别：该问题是否需要联网。启发式拿不准时问一次模型（约1s，仅8 token）。"""
+    verdict = should_search_fast(question)
+    if verdict is not None:
+        return verdict
+    messages = [
+        {"role": "system", "content":
+            "你是搜索需求判断器，只回答一个字：是 或 否。"
+            "判断标准：问题是否需要实时或最新的网络信息才能准确回答"
+            "（时事新闻、价格、天气、比分、软件最新版本、近期发布、具体事实核查等回答\"是\"；"
+            "创作、翻译、代码、概念解释、数学、闲聊、通用建议等回答\"否\"）。"},
+        {"role": "user", "content": question[:300]},
+    ]
+    try:
+        fast = dict(cfg.llm)
+        fast["max_tokens"] = 8
+        fast["temperature"] = 0.0
+        ans = chat_completion(fast, messages, 6.0, model=cfg.llm.get("model"))
+        decision = ans.strip().startswith("是")
+        log.info("情景识别(模型判定): %s → %s", question[:40], "需联网" if decision else "无需联网")
+        return decision
+    except LLMError:
+        return False  # 判定失败按不搜处理，不浪费额度
 
 
 class ChatInterface(dbus.service.Object):
@@ -885,17 +940,17 @@ class ChatInterface(dbus.service.Object):
     @dbus.service.method(CHAT_IFACE, in_signature="su", out_signature="s",
                          async_callbacks=("return_cb", "error_cb"))
     def Ask(self, question, mode, return_cb, error_cb):
-        depth, news = _decode_search_mode(mode)
+        depth, news, auto = _decode_search_mode(mode)
         threading.Thread(target=self._worker, daemon=True,
-                         args=(str(question), bool(mode), depth, news, "", "",
+                         args=(str(question), bool(mode), depth, news, auto, "", "",
                                return_cb, error_cb)).start()
 
     @dbus.service.method(CHAT_IFACE, in_signature="sssu", out_signature="s",
                          async_callbacks=("return_cb", "error_cb"))
     def AskImage(self, question, image_b64, mime, mode, return_cb, error_cb):
-        depth, news = _decode_search_mode(mode)
+        depth, news, auto = _decode_search_mode(mode)
         threading.Thread(target=self._worker, daemon=True,
-                         args=(str(question), bool(mode), depth, news,
+                         args=(str(question), bool(mode), depth, news, auto,
                                str(image_b64), str(mime), return_cb, error_cb)).start()
 
     @dbus.service.method(CHAT_IFACE, out_signature="s")
@@ -939,14 +994,15 @@ class ChatInterface(dbus.service.Object):
 
     # ------------------------------------------------------------------ 内部
 
-    def _worker(self, question, search, depth, news, image_b64, mime, return_cb, error_cb):
+    def _worker(self, question, search, depth, news, auto, image_b64, mime,
+                return_cb, error_cb):
         cfg = self.cfg
         try:
             if not cfg.llm_ready():
                 return_cb(_reply_json(False, error="未配置 API key"))
                 return
             job = AskJob(cfg, self.session, question, search, image_b64, mime,
-                         search_depth=depth, search_news=news)
+                         search_depth=depth, search_news=news, search_auto=auto)
             answer, model_used, searched = job.wait(float(cfg.chat.get("bg_timeout", 60.0)))
             sources = None
             if searched and job.search_results:

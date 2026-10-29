@@ -249,6 +249,28 @@ class TestModelPanel(unittest.TestCase):
         self.assertEqual(daemon.match_model_entries(entries, ""), entries)
 
 
+class TestSearchAutoHeuristic(unittest.TestCase):
+    def test_time_sensitive_yes(self):
+        self.assertIs(daemon.should_search_fast("deepseek最新版本"), True)
+        self.assertIs(daemon.should_search_fast("今天上海天气"), True)
+
+    def test_creative_no(self):
+        self.assertIs(daemon.should_search_fast("写一首关于秋天的诗"), False)
+        self.assertIs(daemon.should_search_fast("翻译这段话成英文: hello"), False)
+        self.assertIs(daemon.should_search_fast("解释一下量子纠缠"), False)
+
+    def test_ambiguous_none(self):
+        self.assertIsNone(daemon.should_search_fast("特斯拉和比亚迪哪个值得买"))
+
+
+class TestDecodeSearchMode(unittest.TestCase):
+    def test_modes(self):
+        self.assertEqual(daemon._decode_search_mode(0), ("basic", False, False))
+        self.assertEqual(daemon._decode_search_mode(2), ("basic", True, False))
+        self.assertEqual(daemon._decode_search_mode(3), ("advanced", False, False))
+        self.assertEqual(daemon._decode_search_mode(4), ("basic", False, True))
+
+
 class TestAutoSearchHeuristic(unittest.TestCase):
     def test_time_words(self):
         self.assertTrue(daemon.looks_like_search_needed("DeepSeek 最新版本"))
